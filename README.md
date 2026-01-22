@@ -13,6 +13,8 @@
 - Adjustable brightness, FPS, and color smoothing.
 - Full RGB color calibration.
 - System tray support.
+  
+Download the Exe and run it or use the py file
 
 run: ```python -m pip install -r requirements.txt``` before opening the py file
 
