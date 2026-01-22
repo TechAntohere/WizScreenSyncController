@@ -58,9 +58,7 @@ QSlider::sub-page:horizontal {
 }
 """
 
-# ============================================================================
-# 🎨 WIDGETS
-# ============================================================================
+# WIDGETS
 
 class StripPreviewBar(QWidget):
     def __init__(self):
@@ -229,9 +227,7 @@ class CanvasZone(QGraphicsRectItem):
             painter.setPen(QPen(QColor(150, 150, 150), 1))
         painter.drawRect(self.rect())
 
-# ============================================================================
-# ⚙️ ENGINE
-# ============================================================================
+# ENGINE
 
 class DiscoveryWorker(QThread):
     found = pyqtSignal(str, str) 
@@ -431,9 +427,8 @@ class MultiSyncWorker(QThread):
         for dev in dev_list:
             self._udp(dev['ip'], dev['mac'], {"method":"setPilot","params":{"mac":dev['mac'],"state":state}})
 
-# ============================================================================
-# 🖥️ GUI
-# ============================================================================
+# GUI
+
 
 class WiZApp(QMainWindow):
     def __init__(self):
@@ -917,3 +912,4 @@ if __name__ == "__main__":
     w = WiZApp()
     w.show()
     sys.exit(app.exec())
+
