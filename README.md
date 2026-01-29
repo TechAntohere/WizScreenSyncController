@@ -1,4 +1,4 @@
-# Program that allows you to control any wiz bulb and lightstrip (all the individual light zones) and use them as synced to your screen colors
+# Program that allows you to control any wiz bulb and lightstrip (all the individual light zones) and use them synced to your screen colors
 
 ### Features:
 
