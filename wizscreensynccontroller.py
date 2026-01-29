@@ -273,7 +273,6 @@ class DiscoveryWorker(QThread):
             time.sleep(0.5)
         for s in sockets: s.close()
         self.finished_scan.emit()
-
 class MultiSyncWorker(QThread):
     log_signal = pyqtSignal(str)
     colors_updated = pyqtSignal(list)
@@ -283,20 +282,27 @@ class MultiSyncWorker(QThread):
         self.running = False
         self.paused = True
         self.devices = [] 
-        self.monitor_idx = 1
-        self.fps = 20
+        self.monitor_idx = 0 
+        self.fps = 60         
         self.brightness = 1.0
-        self.gamma_boost = False
-        self.smoothing = 0.0
-        self.prev_colors_map = {}
-        self.map_widths = [1]*12 
         
-        # FEATURE 5: Color Calibration
+        # --- COLOR ENGINE SETTINGS ---
+        self.gamma = 1.0        # 1.0 = Linear
+        self.saturation = 1.0   # 1.0 = Normal
+        self.min_brightness = 5 # Threshold to kill dark green noise
+        self.color_order = "BGR" # Default for Windows DXCam
+        
         self.gain_r = 1.0
         self.gain_g = 1.0
         self.gain_b = 1.0
         
+        self.prev_colors_map = {}
+        self.map_widths = [1]*12 
+        self.smoothing = 0.0
+        self.downscale = 3 
+        
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.camera = None 
 
     def set_map(self, device_list, widths):
         self.devices = device_list
@@ -304,102 +310,141 @@ class MultiSyncWorker(QThread):
 
     def run(self):
         self.running = True
-        self.log_signal.emit("✅ Engine Started")
+        self.log_signal.emit(f"✅ High-Res Engine Started (1/{self.downscale} Scale)")
         
-        with mss.mss() as sct:
-            while self.running:
-                if self.paused:
-                    time.sleep(0.1)
-                    continue
-                try:
-                    try: mon = sct.monitors[self.monitor_idx + 1]
-                    except: mon = sct.monitors[1]
-                    img = np.array(sct.grab(mon))
-                    h, w = img.shape[:2]
-                    
-                    preview_colors = []
-                    
-                    for dev in self.devices:
-                        dev_colors = []
-                        zones = dev.get('zones', [])
-                        if not zones: 
-                            step = 1.0/12.0
-                            for i in range(12): zones.append( (i*step, 0.4, step, 0.2) )
+        if self.camera is None:
+            try:
+                self.camera = dxcam.create(output_idx=self.monitor_idx, output_color="BGR")
+            except Exception as e:
+                self.log_signal.emit(f"❌ DXCam Error: {e}")
+                return
 
-                        for z in zones:
-                            x1, y1 = int(z[0] * w), int(z[1] * h)
-                            x2, y2 = int((z[0] + z[2]) * w), int((z[1] + z[3]) * h)
-                            x1, y1 = max(0, x1), max(0, y1)
-                            x2, y2 = min(w, x2), min(h, y2)
+        try:
+            self.camera.start(target_fps=self.fps, video_mode=True)
+        except: pass
+
+        while self.running:
+            if self.paused:
+                time.sleep(0.1)
+                continue
+            
+            # 1. CAPTURE
+            img = self.camera.get_latest_frame()
+            if img is None: 
+                time.sleep(0.001)
+                continue
+
+            try:
+
+                img_small = img[::self.downscale, ::self.downscale]
+                
+                h, w = img_small.shape[:2]
+                preview_colors = []
+                
+                for dev in self.devices:
+                    dev_colors = []
+                    zones = dev.get('zones', [])
+                    if not zones: 
+                        step = 1.0/12.0
+                        for i in range(12): zones.append( (i*step, 0.4, step, 0.2) )
+
+                    for z in zones:
+                        # Map normalized coordinates (0.0 to 1.0) to the SMALL image pixels
+                        x1, y1 = int(z[0] * w), int(z[1] * h)
+                        x2, y2 = int((z[0] + z[2]) * w), int((z[1] + z[3]) * h)
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(w, x2), min(h, y2)
+                        
+                        if x2 <= x1 or y2 <= y1: r,g,b = 0,0,0
+                        else:
+                            # Sample from the High-Res image
+                            roi = img_small[y1:y2, x1:x2]
                             
-                            if x2 <= x1 or y2 <= y1: r,g,b = 0,0,0
+                            # THIS IS THE BLUR:
+                            # Averaging all pixels in the ROI creates a smooth color
+                            avg = np.mean(roi, axis=(0,1))
+                            c0, c1, c2 = avg[0], avg[1], avg[2]
+                            
+                            # Channel Swap (Fixes Cyan appearing Green)
+                            if self.color_order == "BGR":   b, g, r = c0, c1, c2
+                            elif self.color_order == "RGB": r, g, b = c0, c1, c2
+                            elif self.color_order == "GRB": g, r, b = c0, c1, c2
+                            else: b, g, r = c0, c1, c2
+
+                            # 3. BLACK LEVEL GATE
+                            luma = 0.299*r + 0.587*g + 0.114*b
+                            if luma < self.min_brightness:
+                                r, g, b = 0, 0, 0
                             else:
-                                roi = img[y1:y2, x1:x2]
-                                avg = np.mean(roi, axis=(0,1))
-                                b, g, r = avg[0], avg[1], avg[2]
-                                
-                                if (r+g+b)/3 < 15: r,g,b = 0,0,0
-                                if self.gamma_boost:
-                                    r = (r/255.0)**0.7 * 255.0 
-                                    g = (g/255.0)**0.7 * 255.0
-                                    b = (b/255.0)**0.7 * 255.0
-                                
-                                # --- CALIBRATION ---
+                                # Gains
                                 r *= self.gain_r
                                 g *= self.gain_g
                                 b *= self.gain_b
-                                
-                                r = int(r * self.brightness)
-                                g = int(g * self.brightness)
-                                b = int(b * self.brightness)
-                                
-                                # Clamp
-                                r = min(255, max(0, r))
-                                g = min(255, max(0, g))
-                                b = min(255, max(0, b))
-                            
-                            dev_colors.append([r, g, b])
-                        
-                        uuid = dev.get('uuid', 'unknown')
-                        if self.smoothing > 0.0:
-                            if uuid not in self.prev_colors_map:
-                                self.prev_colors_map[uuid] = dev_colors
-                            else:
-                                prev = self.prev_colors_map[uuid]
-                                smoothed = []
-                                for i in range(len(dev_colors)):
-                                    pr, pg, pb = prev[i]
-                                    nr, ng, nb = dev_colors[i]
-                                    sr = pr * self.smoothing + nr * (1.0 - self.smoothing)
-                                    sg = pg * self.smoothing + ng * (1.0 - self.smoothing)
-                                    sb = pb * self.smoothing + nb * (1.0 - self.smoothing)
-                                    smoothed.append([sr, sg, sb])
-                                dev_colors = smoothed
-                                self.prev_colors_map[uuid] = dev_colors
-                        
-                        final_colors = [[int(c[0]), int(c[1]), int(c[2])] for c in dev_colors]
-                        self._send_to_device(dev, final_colors)
-                        
-                        if dev['type'] == DeviceType.STRIP and not preview_colors:
-                            preview_colors = final_colors
 
-                    if preview_colors:
-                        self.colors_updated.emit(preview_colors)
+                                # Saturation
+                                if self.saturation != 1.0:
+                                    gray = luma
+                                    r = gray + (r - gray) * self.saturation
+                                    g = gray + (g - gray) * self.saturation
+                                    b = gray + (b - gray) * self.saturation
+
+                                # Gamma
+                                if self.gamma != 1.0:
+                                    r = 255.0 * (max(0, r) / 255.0) ** self.gamma
+                                    g = 255.0 * (max(0, g) / 255.0) ** self.gamma
+                                    b = 255.0 * (max(0, b) / 255.0) ** self.gamma
+
+                                # Brightness
+                                r *= self.brightness
+                                g *= self.brightness
+                                b *= self.brightness
+                                
+                                r = min(255, max(0, int(r)))
+                                g = min(255, max(0, int(g)))
+                                b = min(255, max(0, int(b)))
+
+                        dev_colors.append([r, g, b])
                     
-                    time.sleep(1.0/self.fps)
-                except Exception: pass
+                    # Smoothing (Temporal)
+                    uuid = dev.get('uuid', 'unknown')
+                    if self.smoothing > 0.0:
+                        if uuid not in self.prev_colors_map:
+                            self.prev_colors_map[uuid] = dev_colors
+                        else:
+                            prev = self.prev_colors_map[uuid]
+                            smoothed = []
+                            for i in range(len(dev_colors)):
+                                pr, pg, pb = prev[i]
+                                nr, ng, nb = dev_colors[i]
+                                sr = pr * self.smoothing + nr * (1.0 - self.smoothing)
+                                sg = pg * self.smoothing + ng * (1.0 - self.smoothing)
+                                sb = pb * self.smoothing + nb * (1.0 - self.smoothing)
+                                smoothed.append([sr, sg, sb])
+                            dev_colors = smoothed
+                            self.prev_colors_map[uuid] = dev_colors
+                    
+                    final_colors = [[int(c[0]), int(c[1]), int(c[2])] for c in dev_colors]
+                    self._send_to_device(dev, final_colors)
+                    
+                    if dev['type'].startswith("Strip") and not preview_colors:
+                        preview_colors = final_colors
 
+                if preview_colors:
+                    self.colors_updated.emit(preview_colors)
+            except Exception: pass
+        self.camera.stop()
+        
     def _send_to_device(self, dev, colors):
-        if dev['type'] == DeviceType.BULB:
+        if dev['type'].startswith("Bulb"):
             if not colors: return
             c = colors[0]
             self._udp(dev['ip'], dev['mac'], {"method":"setPilot","params":{"mac":dev['mac'],"r":c[0],"g":c[1],"b":c[2],"dimming":100}})
-        elif dev['type'] == DeviceType.STRIP:
+        elif dev['type'].startswith("Strip"):
             steps = []
             for i in range(12):
                 c = colors[i] if i < len(colors) else [0,0,0]
                 w = int(self.map_widths[i]) if i < len(self.map_widths) else 1
-                steps.append([0, c[0], c[1], c[2], 0, 0, 0, 40, 0, 0, 0, 0, w])
+                steps.append([0, c[0], c[1], c[2], 0, 0, 0, 100, 0, 0, 0, 0, w])
             self._udp(dev['ip'], dev['mac'], {"method":"setPilot","params":{"mac":dev['mac'],"state":True,"sceneId":257,"elm":{"modifier":100,"support":17,"steps":steps}}})
 
     def _udp(self, ip, mac, payload):
@@ -407,10 +452,10 @@ class MultiSyncWorker(QThread):
             data = json.dumps(payload, separators=(',', ':')).encode()
             self.sock.sendto(data, (ip, UDP_PORT))
         except: pass
-        
+    
     def send_manual_color(self, dev_list, colors_map, widths):
         for dev in dev_list:
-            if dev['type'] == DeviceType.BULB:
+            if dev['type'].startswith("Bulb"):
                 if 0 in colors_map:
                     c = colors_map[0]
                     self._udp(dev['ip'], dev['mac'], {"method":"setPilot","params":{"mac":dev['mac'],"r":c[0],"g":c[1],"b":c[2],"dimming":100}})
@@ -426,6 +471,7 @@ class MultiSyncWorker(QThread):
     def send_power_all(self, dev_list, state):
         for dev in dev_list:
             self._udp(dev['ip'], dev['mac'], {"method":"setPilot","params":{"mac":dev['mac'],"state":state}})
+
 
 # GUI
 
@@ -912,4 +958,5 @@ if __name__ == "__main__":
     w = WiZApp()
     w.show()
     sys.exit(app.exec())
+
 
